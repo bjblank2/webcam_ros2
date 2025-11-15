@@ -28,7 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'ros2_wecam_node = webcam_ros2.ros2_wecam_node:main'
+            'webcam_ros2 = webcam_ros2.webcam_ros2_node:main'
         ],
     },
 )

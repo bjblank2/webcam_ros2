@@ -6,9 +6,9 @@ This node publishes camera image messages from webcams.
 Supports multiple cameras and can publish to different topics.
 """
 
-import rclpy
+import rclpy 
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import threading
@@ -29,6 +29,9 @@ class Ros2CamNode(Node):
         self.declare_parameter('camera_names', ['camera'])  # Topic names for each camera
         self.declare_parameter('width', 640)
         self.declare_parameter('height', 480)
+        self.declare_parameter('publish_compressed', True)  # Publish compressed images
+        self.declare_parameter('compression_format', 'jpeg')  # 'jpeg' or 'png'
+        self.declare_parameter('jpeg_quality', 80)  # JPEG quality (1-100)
 
         # Handle string-to-number/list conversion from launch files
         camera_ids_val = self.get_parameter('camera_ids').value
@@ -60,6 +63,15 @@ class Ros2CamNode(Node):
         
         height_val = self.get_parameter('height').value
         self.height = int(height_val) if height_val is not None else 480
+        
+        publish_compressed_val = self.get_parameter('publish_compressed').value
+        self.publish_compressed = bool(publish_compressed_val) if publish_compressed_val is not None else True
+        
+        compression_format_val = self.get_parameter('compression_format').value
+        self.compression_format = str(compression_format_val) if compression_format_val is not None else 'jpeg'
+        
+        jpeg_quality_val = self.get_parameter('jpeg_quality').value
+        self.jpeg_quality = int(jpeg_quality_val) if jpeg_quality_val is not None else 80
 
         # Ensure camera_ids is a list
         if not isinstance(camera_ids, list):
@@ -79,7 +91,8 @@ class Ros2CamNode(Node):
 
         # Dictionary to store camera objects, publishers, and threads
         self.cameras = {}
-        self.publishers = {}
+        self.image_publishers = {}
+        self.compressed_image_publishers = {}
         self.camera_threads = {}
         self.running = True
 
@@ -114,13 +127,29 @@ class Ros2CamNode(Node):
                 # Store camera object
                 self.cameras[camera_name] = cap
 
-                # Create publisher
-                topic_name = f'/{camera_name}/image_raw'
-                self.publishers[camera_name] = self.create_publisher(
-                    Image,
-                    topic_name,
-                    10
-                )
+                # Create publishers
+                if self.publish_compressed:
+                    # Compressed image publisher
+                    compressed_topic_name = f'/{camera_name}/image_raw/compressed'
+                    self.compressed_image_publishers[camera_name] = self.create_publisher(
+                        CompressedImage,
+                        compressed_topic_name,
+                        10
+                    )
+                    self.get_logger().info(
+                        f'Camera {camera_id} ({camera_name}) will publish compressed images to {compressed_topic_name}'
+                    )
+                else:
+                    # Raw image publisher
+                    topic_name = f'/{camera_name}/image_raw'
+                    self.image_publishers[camera_name] = self.create_publisher(
+                        Image,
+                        topic_name,
+                        10
+                    )
+                    self.get_logger().info(
+                        f'Camera {camera_id} ({camera_name}) will publish raw images to {topic_name}'
+                    )
 
                 # Start publishing thread
                 thread = threading.Thread(
@@ -130,11 +159,6 @@ class Ros2CamNode(Node):
                 )
                 thread.start()
                 self.camera_threads[camera_name] = thread
-
-                self.get_logger().info(
-                    f'Camera {camera_id} ({camera_name}) initialized, '
-                    f'publishing to {topic_name}'
-                )
 
             except Exception as e:
                 self.get_logger().error(
@@ -147,7 +171,6 @@ class Ros2CamNode(Node):
             return
 
         cap = self.cameras[camera_name]
-        publisher = self.publishers[camera_name]
         
         frame_time = 1.0 / self.frame_rate if self.frame_rate > 0 else 0.033
 
@@ -162,17 +185,50 @@ class Ros2CamNode(Node):
                     time.sleep(frame_time)
                     continue
 
-                # Convert BGR to RGB (OpenCV uses BGR, ROS typically expects RGB)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                # Convert to ROS Image message
+                # Get current timestamp
+                timestamp = self.get_clock().now().to_msg()
+                
                 try:
-                    ros_image = self.bridge.cv2_to_imgmsg(frame_rgb, 'rgb8')
-                    ros_image.header.stamp = self.get_clock().now().to_msg()
-                    ros_image.header.frame_id = camera_name
-                    
-                    # Publish
-                    publisher.publish(ros_image)
+                    if self.publish_compressed:
+                        # Publish compressed image
+                        if camera_name in self.compressed_image_publishers:
+                            compressed_msg = CompressedImage()
+                            compressed_msg.header.stamp = timestamp
+                            compressed_msg.header.frame_id = camera_name
+                            
+                            # Compress image directly (OpenCV uses BGR, which is preserved in compressed format)
+                            if self.compression_format.lower() == 'jpeg':
+                                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+                                result, encimg = cv2.imencode('.jpg', frame, encode_param)
+                                compressed_msg.format = 'jpeg'
+                            elif self.compression_format.lower() == 'png':
+                                encode_param = [int(cv2.IMWRITE_PNG_COMPRESSION), 9]
+                                result, encimg = cv2.imencode('.png', frame, encode_param)
+                                compressed_msg.format = 'png'
+                            else:
+                                # Default to JPEG
+                                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+                                result, encimg = cv2.imencode('.jpg', frame, encode_param)
+                                compressed_msg.format = 'jpeg'
+                            
+                            if result:
+                                compressed_msg.data = encimg.tobytes()
+                                self.compressed_image_publishers[camera_name].publish(compressed_msg)
+                            else:
+                                self.get_logger().warn(
+                                    f'Failed to compress image from camera {camera_name}'
+                                )
+                    else:
+                        # Publish raw image
+                        if camera_name in self.image_publishers:
+                            # Convert BGR to RGB (OpenCV uses BGR, ROS typically expects RGB)
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            
+                            ros_image = self.bridge.cv2_to_imgmsg(frame_rgb, 'rgb8')
+                            ros_image.header.stamp = timestamp
+                            ros_image.header.frame_id = camera_name
+                            
+                            self.image_publishers[camera_name].publish(ros_image)
                 except Exception as e:
                     self.get_logger().error(
                         f'Error converting/publishing image from {camera_name}: {e}'
