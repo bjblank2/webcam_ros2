@@ -91,6 +91,7 @@ class Ros2CamNode(Node):
 
         # Dictionary to store camera objects, publishers, and threads
         self.cameras = {}
+        self.camera_locks = {}
         self.image_publishers = {}
         self.compressed_image_publishers = {}
         self.camera_threads = {}
@@ -126,6 +127,7 @@ class Ros2CamNode(Node):
 
                 # Store camera object
                 self.cameras[camera_name] = cap
+                self.camera_locks[camera_name] = threading.Lock()
 
                 # Create publishers
                 if self.publish_compressed:
@@ -170,14 +172,20 @@ class Ros2CamNode(Node):
         if camera_name not in self.cameras:
             return
 
-        cap = self.cameras[camera_name]
-        
         frame_time = 1.0 / self.frame_rate if self.frame_rate > 0 else 0.033
 
         while self.running:
             try:
-                ret, frame = cap.read()
-                
+                # Re-fetch the current camera handle (and hold its lock) on every
+                # iteration — check_camera_status() may release() the old handle
+                # and swap in a new VideoCapture on reconnect; reading a captured
+                # reference from thread start would silently read a dead camera
+                # forever after any transient disconnect.
+                lock = self.camera_locks[camera_name]
+                with lock:
+                    cap = self.cameras[camera_name]
+                    ret, frame = cap.read()
+
                 if not ret:
                     self.get_logger().warn(
                         f'Failed to read frame from camera {camera_name}'
@@ -255,12 +263,18 @@ class Ros2CamNode(Node):
                 camera_id = self.camera_ids[idx] if idx < len(self.camera_ids) else 0
                 
                 try:
-                    cap.release()
-                    new_cap = cv2.VideoCapture(camera_id)
-                    if new_cap.isOpened():
-                        new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                        new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                        self.cameras[camera_name] = new_cap
+                    # Hold the same lock the publish thread uses so we never
+                    # release() a handle it's concurrently read()-ing, and so it
+                    # never reads through a released handle after the swap below.
+                    with self.camera_locks[camera_name]:
+                        cap.release()
+                        new_cap = cv2.VideoCapture(camera_id)
+                        reconnected = new_cap.isOpened()
+                        if reconnected:
+                            new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                            new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                            self.cameras[camera_name] = new_cap
+                    if reconnected:
                         self.get_logger().info(f'Camera {camera_name} reconnected')
                     else:
                         self.get_logger().error(f'Failed to reconnect camera {camera_name}')
